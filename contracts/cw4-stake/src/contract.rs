@@ -12,7 +12,7 @@ use cw4::{
     TotalWeightResponse,
 };
 use cw_storage_plus::Bound;
-use utils::{maybe_addr, NativeBalance};
+use cw_utils::{maybe_addr, NativeBalance};
 
 use crate::error::ContractError;
 use crate::msg::{ExecuteMsg, InstantiateMsg, QueryMsg, ReceiveMsg, StakedResponse};
@@ -339,21 +339,20 @@ fn list_members(
 ) -> StdResult<MemberListResponse> {
     let limit = limit.unwrap_or(DEFAULT_LIMIT).min(MAX_LIMIT) as usize;
     let addr = maybe_addr(deps.api, start_after)?;
-    let start = addr.map(|addr| Bound::exclusive(addr.as_ref()));
+    let start = addr.as_ref().map(Bound::exclusive);
 
-    let members: StdResult<Vec<_>> = MEMBERS
+    let members = MEMBERS
         .range(deps.storage, start, None, Order::Ascending)
         .take(limit)
         .map(|item| {
-            let (key, weight) = item?;
-            Ok(Member {
-                addr: String::from_utf8(key)?,
+            item.map(|(addr, weight)| Member {
+                addr: addr.into(),
                 weight,
             })
         })
-        .collect();
+        .collect::<StdResult<_>>()?;
 
-    Ok(MemberListResponse { members: members? })
+    Ok(MemberListResponse { members })
 }
 
 #[cfg(test)]
@@ -365,7 +364,7 @@ mod tests {
     use cw20::Denom;
     use cw4::{member_key, TOTAL_KEY};
     use cw_controllers::{AdminError, Claim, HookError};
-    use utils::Duration;
+    use cw_utils::Duration;
 
     use crate::error::ContractError;
 
@@ -670,7 +669,7 @@ mod tests {
             }) => {
                 assert_eq!(contract_addr.as_str(), CW20_ADDRESS);
                 assert_eq!(funds.len(), 0);
-                let parsed: Cw20ExecuteMsg = from_slice(&msg).unwrap();
+                let parsed: Cw20ExecuteMsg = from_slice(msg).unwrap();
                 assert_eq!(
                     parsed,
                     Cw20ExecuteMsg::Transfer {

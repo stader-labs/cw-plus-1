@@ -4,8 +4,8 @@
 //! Additionally it bypass all events and attributes send to it
 
 use cosmwasm_std::{
-    to_binary, Attribute, Binary, ContractResult, Deps, DepsMut, Empty, Env, Event, MessageInfo,
-    Reply, Response, StdError, SubMsg, SubMsgExecutionResponse,
+    to_binary, Attribute, Binary, Deps, DepsMut, Empty, Env, Event, MessageInfo, Reply, Response,
+    StdError, SubMsg, SubMsgResponse, SubMsgResult,
 };
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
@@ -13,8 +13,8 @@ use crate::{test_helpers::EmptyMsg, Contract, ContractWrapper};
 use schemars::JsonSchema;
 use std::fmt::Debug;
 
+use cw_utils::{parse_execute_response_data, parse_instantiate_response_data};
 use derivative::Derivative;
-use utils::{parse_execute_response_data, parse_instantiate_response_data};
 
 // Choosing a reply id less than ECHO_EXECUTE_BASE_ID indicates an Instantiate message reply by convention.
 // An Execute message reply otherwise.
@@ -97,24 +97,22 @@ where
     let res = Response::new();
     if let Reply {
         id,
-        result:
-            ContractResult::Ok(SubMsgExecutionResponse {
-                data: Some(data), ..
-            }),
+        result: SubMsgResult::Ok(SubMsgResponse {
+            data: Some(data), ..
+        }),
     } = msg
     {
         // We parse out the WasmMsg::Execute wrapper...
         // TODO: Handle all of Execute, Instantiate, and BankMsg replies differently.
-        let parsed_data;
-        if id < EXECUTE_REPLY_BASE_ID {
-            parsed_data = parse_instantiate_response_data(data.as_slice())
+        let parsed_data = if id < EXECUTE_REPLY_BASE_ID {
+            parse_instantiate_response_data(data.as_slice())
                 .map_err(|e| StdError::generic_err(e.to_string()))?
-                .data;
+                .data
         } else {
-            parsed_data = parse_execute_response_data(data.as_slice())
+            parse_execute_response_data(data.as_slice())
                 .map_err(|e| StdError::generic_err(e.to_string()))?
-                .data;
-        }
+                .data
+        };
 
         if let Some(data) = parsed_data {
             Ok(res.set_data(data))

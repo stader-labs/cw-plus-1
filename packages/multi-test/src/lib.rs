@@ -8,6 +8,7 @@
 
 mod app;
 mod bank;
+#[allow(clippy::type_complexity)]
 mod contracts;
 pub mod custom_handler;
 pub mod error;
@@ -16,7 +17,6 @@ mod module;
 mod staking;
 mod test_helpers;
 mod transactions;
-mod untyped_msg;
 mod wasm;
 
 pub use crate::app::{

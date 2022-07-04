@@ -1,7 +1,7 @@
 use cosmwasm_std::entry_point;
 use cosmwasm_std::{
-    to_binary, Addr, Binary, Deps, DepsMut, Env, MessageInfo, Order, Record, Response, StdResult,
-    SubMsg, Uint128,
+    to_binary, Addr, Binary, Deps, DepsMut, Env, MessageInfo, Order, Response, StdResult, SubMsg,
+    Uint128,
 };
 use cw_storage_plus::Bound;
 
@@ -11,7 +11,7 @@ use cw1155::{
     IsApprovedForAllResponse, TokenId, TokenInfoResponse, TokensResponse, TransferEvent,
 };
 use cw2::set_contract_version;
-use utils::{maybe_addr, Event};
+use cw_utils::{maybe_addr, Event};
 
 use crate::error::ContractError;
 use crate::msg::InstantiateMsg;
@@ -133,7 +133,7 @@ fn check_can_approve(deps: Deps, env: &Env, owner: &Addr, operator: &Addr) -> St
         return Ok(true);
     }
     // operator can approve
-    let op = APPROVES.may_load(deps.storage, (&owner, &operator))?;
+    let op = APPROVES.may_load(deps.storage, (owner, operator))?;
     Ok(match op {
         Some(ex) => !ex.is_expired(&env.block),
         None => false,
@@ -325,13 +325,13 @@ pub fn execute_batch_mint(
     let mut rsp = Response::default();
 
     for (token_id, amount) in batch.iter() {
-        let event = execute_transfer_inner(&mut deps, None, Some(&to_addr), &token_id, *amount)?;
+        let event = execute_transfer_inner(&mut deps, None, Some(&to_addr), token_id, *amount)?;
         event.add_attributes(&mut rsp);
 
         // insert if not exist
-        if !TOKENS.has(deps.storage, &token_id) {
+        if !TOKENS.has(deps.storage, token_id) {
             // we must save some valid data here
-            TOKENS.save(deps.storage, &token_id, &String::new())?;
+            TOKENS.save(deps.storage, token_id, &String::new())?;
         }
     }
 
@@ -478,10 +478,10 @@ pub fn query(deps: Deps, env: Env, msg: Cw1155QueryMsg) -> StdResult<Binary> {
     }
 }
 
-fn parse_approval(item: StdResult<Record<Expiration>>) -> StdResult<cw1155::Approval> {
-    item.and_then(|(k, expires)| {
-        let spender = String::from_utf8(k)?;
-        Ok(cw1155::Approval { spender, expires })
+fn build_approval(item: StdResult<(Addr, Expiration)>) -> StdResult<cw1155::Approval> {
+    item.map(|(addr, expires)| cw1155::Approval {
+        spender: addr.into(),
+        expires,
     })
 }
 
@@ -494,14 +494,14 @@ fn query_all_approvals(
     limit: Option<u32>,
 ) -> StdResult<ApprovedForAllResponse> {
     let limit = limit.unwrap_or(DEFAULT_LIMIT).min(MAX_LIMIT) as usize;
-    let start = start_after.map(|addr| Bound::exclusive(addr.as_ref()));
+    let start = start_after.as_ref().map(Bound::exclusive);
 
     let operators = APPROVES
         .prefix(&owner)
         .range(deps.storage, start, None, Order::Ascending)
         .filter(|r| include_expired || r.is_err() || !r.as_ref().unwrap().1.is_expired(&env.block))
         .take(limit)
-        .map(parse_approval)
+        .map(build_approval)
         .collect::<StdResult<_>>()?;
     Ok(ApprovedForAllResponse { operators })
 }
@@ -513,13 +513,12 @@ fn query_tokens(
     limit: Option<u32>,
 ) -> StdResult<TokensResponse> {
     let limit = limit.unwrap_or(DEFAULT_LIMIT).min(MAX_LIMIT) as usize;
-    let start = start_after.map(Bound::exclusive);
+    let start = start_after.as_ref().map(|s| Bound::exclusive(s.as_str()));
 
     let tokens = BALANCES
         .prefix(&owner)
-        .range(deps.storage, start, None, Order::Ascending)
+        .keys(deps.storage, start, None, Order::Ascending)
         .take(limit)
-        .map(|item| item.map(|(k, _)| String::from_utf8(k).unwrap()))
         .collect::<StdResult<_>>()?;
     Ok(TokensResponse { tokens })
 }
@@ -530,11 +529,10 @@ fn query_all_tokens(
     limit: Option<u32>,
 ) -> StdResult<TokensResponse> {
     let limit = limit.unwrap_or(DEFAULT_LIMIT).min(MAX_LIMIT) as usize;
-    let start = start_after.map(Bound::exclusive);
+    let start = start_after.as_ref().map(|s| Bound::exclusive(s.as_str()));
     let tokens = TOKENS
-        .range(deps.storage, start, None, Order::Ascending)
+        .keys(deps.storage, start, None, Order::Ascending)
         .take(limit)
-        .map(|item| item.map(|(k, _)| String::from_utf8(k).unwrap()))
         .collect::<StdResult<_>>()?;
     Ok(TokensResponse { tokens })
 }

@@ -1,12 +1,11 @@
 use std::fmt;
 
 use cosmwasm_std::{
-    to_binary, Addr, Attribute, BankMsg, Binary, Coin, CosmosMsg, Event, SubMsgExecutionResponse,
-    WasmMsg,
+    to_binary, Addr, Attribute, BankMsg, Binary, Coin, CosmosMsg, Event, SubMsgResponse, WasmMsg,
 };
+use cw_utils::{parse_execute_response_data, parse_instantiate_response_data};
 use schemars::JsonSchema;
 use serde::Serialize;
-use utils::{parse_execute_response_data, parse_instantiate_response_data};
 
 use anyhow::Result as AnyResult;
 
@@ -52,8 +51,8 @@ impl AppResponse {
 
 /// They have the same shape, SubMsgExecutionResponse is what is returned in reply.
 /// This is just to make some test cases easier.
-impl From<SubMsgExecutionResponse> for AppResponse {
-    fn from(reply: SubMsgExecutionResponse) -> Self {
+impl From<SubMsgResponse> for AppResponse {
+    fn from(reply: SubMsgResponse) -> Self {
         AppResponse {
             data: reply.data,
             events: reply.events,
@@ -98,20 +97,20 @@ where
     /// Execute a contract and process all returned messages.
     /// This is just a helper around execute(),
     /// but we parse out the data field to that what is returned by the contract (not the protobuf wrapper)
-    fn execute_contract<T: Serialize>(
+    fn execute_contract<T: Serialize + std::fmt::Debug>(
         &mut self,
         sender: Addr,
         contract_addr: Addr,
         msg: &T,
         send_funds: &[Coin],
     ) -> AnyResult<AppResponse> {
-        let msg = to_binary(msg)?;
-        let msg = WasmMsg::Execute {
-            contract_addr: contract_addr.into(),
-            msg,
+        let binary_msg = to_binary(msg)?;
+        let wrapped_msg = WasmMsg::Execute {
+            contract_addr: contract_addr.into_string(),
+            msg: binary_msg,
             funds: send_funds.to_vec(),
         };
-        let mut res = self.execute(sender, msg.into())?;
+        let mut res = self.execute(sender, wrapped_msg.into())?;
         res.data = res
             .data
             .and_then(|d| parse_execute_response_data(d.as_slice()).unwrap().data);

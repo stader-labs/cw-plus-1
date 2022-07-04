@@ -10,7 +10,7 @@ use cw4::{
     TotalWeightResponse,
 };
 use cw_storage_plus::Bound;
-use utils::maybe_addr;
+use cw_utils::maybe_addr;
 
 use crate::error::ContractError;
 use crate::msg::{ExecuteMsg, InstantiateMsg, QueryMsg};
@@ -190,21 +190,20 @@ fn list_members(
 ) -> StdResult<MemberListResponse> {
     let limit = limit.unwrap_or(DEFAULT_LIMIT).min(MAX_LIMIT) as usize;
     let addr = maybe_addr(deps.api, start_after)?;
-    let start = addr.map(|addr| Bound::exclusive(addr.to_string()));
+    let start = addr.as_ref().map(Bound::exclusive);
 
-    let members: StdResult<Vec<_>> = MEMBERS
+    let members = MEMBERS
         .range(deps.storage, start, None, Order::Ascending)
         .take(limit)
         .map(|item| {
-            let (key, weight) = item?;
-            Ok(Member {
-                addr: String::from_utf8(key)?,
+            item.map(|(addr, weight)| Member {
+                addr: addr.into(),
                 weight,
             })
         })
-        .collect();
+        .collect::<StdResult<_>>()?;
 
-    Ok(MemberListResponse { members: members? })
+    Ok(MemberListResponse { members })
 }
 
 #[cfg(test)]

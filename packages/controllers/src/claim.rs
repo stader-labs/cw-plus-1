@@ -1,9 +1,9 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use cosmwasm_std::{Addr, BlockInfo, Deps, StdResult, Storage, Uint128};
+use cosmwasm_std::{Addr, BlockInfo, CustomQuery, Deps, StdResult, Storage, Uint128};
 use cw_storage_plus::Map;
-use utils::Expiration;
+use cw_utils::Expiration;
 
 // TODO: pull into utils?
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, JsonSchema)]
@@ -86,7 +86,11 @@ impl<'a> Claims<'a> {
         Ok(to_send)
     }
 
-    pub fn query_claims(&self, deps: Deps, address: &Addr) -> StdResult<ClaimsResponse> {
+    pub fn query_claims<Q: CustomQuery>(
+        &self,
+        deps: Deps<Q>,
+        address: &Addr,
+    ) -> StdResult<ClaimsResponse> {
         let claims = self.0.may_load(deps.storage, address)?.unwrap_or_default();
         Ok(ClaimsResponse { claims })
     }
@@ -118,7 +122,7 @@ mod test {
         assert_eq!(
             claims
                 .0
-                .range(&deps.storage, None, None, Order::Ascending)
+                .range_raw(&deps.storage, None, None, Order::Ascending)
                 .collect::<StdResult<Vec<_>>>()
                 .unwrap()
                 .len(),
