@@ -8,6 +8,7 @@
 
 mod app;
 mod bank;
+#[allow(clippy::type_complexity)]
 mod contracts;
 pub mod custom_handler;
 pub mod error;
@@ -16,7 +17,6 @@ mod module;
 mod staking;
 mod test_helpers;
 mod transactions;
-mod untyped_msg;
 mod wasm;
 
 pub use crate::app::{
@@ -26,6 +26,6 @@ pub use crate::app::{
 pub use crate::bank::{Bank, BankKeeper, BankSudo};
 pub use crate::contracts::{Contract, ContractWrapper};
 pub use crate::executor::{AppResponse, Executor};
-pub use crate::module::Module;
-pub use crate::staking::{FailingDistribution, FailingStaking, Staking, StakingSudo};
+pub use crate::module::{FailingModule, Module};
+pub use crate::staking::{Distribution, FailingDistribution, FailingStaking, Staking, StakingSudo};
 pub use crate::wasm::{Wasm, WasmKeeper, WasmSudo};

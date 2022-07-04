@@ -5,8 +5,9 @@ mod map;
 pub use item::SnapshotItem;
 pub use map::SnapshotMap;
 
+use crate::bound::Bound;
 use crate::de::KeyDeserialize;
-use crate::{Bound, Map, Prefixer, PrimaryKey};
+use crate::{Map, Prefixer, PrimaryKey};
 use cosmwasm_std::{Order, StdError, StdResult, Storage};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -88,7 +89,7 @@ where
             let first = self
                 .changelog
                 .prefix(k.clone())
-                .range(store, Some(start), None, Order::Ascending)
+                .range_raw(store, Some(start), None, Order::Ascending)
                 .next()
                 .transpose()?;
             if first.is_none() {
@@ -143,11 +144,11 @@ where
 
         // this will look for the first snapshot of height >= given height
         // If None, there is no snapshot since that time.
-        let start = Bound::inclusive_int(height);
+        let start = Bound::inclusive(height);
         let first = self
             .changelog
             .prefix(key)
-            .range(store, Some(start), None, Order::Ascending)
+            .range_raw(store, Some(start), None, Order::Ascending)
             .next();
 
         if let Some(r) = first {
@@ -172,7 +173,7 @@ pub enum Strategy {
 }
 
 #[derive(Clone, Copy, PartialEq, Debug, Serialize, Deserialize)]
-pub(crate) struct ChangeSet<T> {
+pub struct ChangeSet<T> {
     pub old: Option<T>,
 }
 

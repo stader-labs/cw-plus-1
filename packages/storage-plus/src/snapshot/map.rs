@@ -3,13 +3,14 @@ use serde::Serialize;
 
 use cosmwasm_std::{StdError, StdResult, Storage};
 
+use crate::bound::PrefixBound;
 use crate::de::KeyDeserialize;
 use crate::iter_helpers::deserialize_kv;
 use crate::keys::PrimaryKey;
 use crate::map::Map;
 use crate::path::Path;
-use crate::prefix::{namespaced_prefix_range, Prefix, PrefixBound};
-use crate::snapshot::Snapshot;
+use crate::prefix::{namespaced_prefix_range, Prefix};
+use crate::snapshot::{ChangeSet, Snapshot};
 use crate::{Bound, Prefixer, Strategy};
 
 /// Map that maintains a snapshots of one or more checkpoints.
@@ -44,6 +45,10 @@ impl<'a, K, T> SnapshotMap<'a, K, T> {
             snapshots: Snapshot::new(checkpoints, changelog, strategy),
         }
     }
+
+    pub fn changelog(&self) -> &Map<'a, (K, u64), ChangeSet<T>> {
+        &self.snapshots.changelog
+    }
 }
 
 impl<'a, K, T> SnapshotMap<'a, K, T>
@@ -69,16 +74,8 @@ where
         self.primary.key(k)
     }
 
-    pub fn prefix(&self, p: K::Prefix) -> Prefix<Vec<u8>, T> {
-        self.primary.prefix(p)
-    }
-
-    pub fn sub_prefix(&self, p: K::SubPrefix) -> Prefix<Vec<u8>, T> {
-        self.primary.sub_prefix(p)
-    }
-
-    fn no_prefix(&self) -> Prefix<Vec<u8>, T> {
-        self.primary.no_prefix()
+    fn no_prefix_raw(&self) -> Prefix<Vec<u8>, T, K> {
+        self.primary.no_prefix_raw()
     }
 
     /// load old value and store changelog
@@ -164,7 +161,7 @@ where
     }
 }
 
-// short-cut for simple keys, rather than .prefix(()).range(...)
+// short-cut for simple keys, rather than .prefix(()).range_raw(...)
 impl<'a, K, T> SnapshotMap<'a, K, T>
 where
     T: Serialize + DeserializeOwned + Clone,
@@ -172,17 +169,30 @@ where
 {
     // I would prefer not to copy code from Prefix, but no other way
     // with lifetimes (create Prefix inside function and return ref = no no)
-    pub fn range<'c>(
+    pub fn range_raw<'c>(
         &self,
         store: &'c dyn Storage,
-        min: Option<Bound>,
-        max: Option<Bound>,
+        min: Option<Bound<'a, K>>,
+        max: Option<Bound<'a, K>>,
         order: cosmwasm_std::Order,
     ) -> Box<dyn Iterator<Item = StdResult<cosmwasm_std::Record<T>>> + 'c>
     where
         T: 'c,
     {
-        self.no_prefix().range(store, min, max, order)
+        self.no_prefix_raw().range_raw(store, min, max, order)
+    }
+
+    pub fn keys_raw<'c>(
+        &self,
+        store: &'c dyn Storage,
+        min: Option<Bound<'a, K>>,
+        max: Option<Bound<'a, K>>,
+        order: cosmwasm_std::Order,
+    ) -> Box<dyn Iterator<Item = Vec<u8>> + 'c>
+    where
+        T: 'c,
+    {
+        self.no_prefix_raw().keys_raw(store, min, max, order)
     }
 }
 
@@ -192,13 +202,13 @@ where
     T: Serialize + DeserializeOwned,
     K: PrimaryKey<'a> + KeyDeserialize,
 {
-    /// While `range_de` over a `prefix_de` fixes the prefix to one element and iterates over the
-    /// remaining, `prefix_range_de` accepts bounds for the lowest and highest elements of the
+    /// While `range` over a `prefix` fixes the prefix to one element and iterates over the
+    /// remaining, `prefix_range` accepts bounds for the lowest and highest elements of the
     /// `Prefix` itself, and iterates over those (inclusively or exclusively, depending on
     /// `PrefixBound`).
     /// There are some issues that distinguish these two, and blindly casting to `Vec<u8>` doesn't
     /// solve them.
-    pub fn prefix_range_de<'c>(
+    pub fn prefix_range<'c>(
         &self,
         store: &'c dyn Storage,
         min: Option<PrefixBound<'a, K::Prefix>>,
@@ -216,43 +226,43 @@ where
         Box::new(mapped)
     }
 
-    pub fn range_de<'c>(
+    pub fn range<'c>(
         &self,
         store: &'c dyn Storage,
-        min: Option<Bound>,
-        max: Option<Bound>,
+        min: Option<Bound<'a, K>>,
+        max: Option<Bound<'a, K>>,
         order: cosmwasm_std::Order,
     ) -> Box<dyn Iterator<Item = StdResult<(K::Output, T)>> + 'c>
     where
         T: 'c,
         K::Output: 'static,
     {
-        self.no_prefix_de().range_de(store, min, max, order)
+        self.no_prefix().range(store, min, max, order)
     }
 
-    pub fn keys_de<'c>(
+    pub fn keys<'c>(
         &self,
         store: &'c dyn Storage,
-        min: Option<Bound>,
-        max: Option<Bound>,
+        min: Option<Bound<'a, K>>,
+        max: Option<Bound<'a, K>>,
         order: cosmwasm_std::Order,
     ) -> Box<dyn Iterator<Item = StdResult<K::Output>> + 'c>
     where
         T: 'c,
         K::Output: 'static,
     {
-        self.no_prefix_de().keys_de(store, min, max, order)
+        self.no_prefix().keys(store, min, max, order)
     }
 
-    pub fn prefix_de(&self, p: K::Prefix) -> Prefix<K::Suffix, T> {
+    pub fn prefix(&self, p: K::Prefix) -> Prefix<K::Suffix, T, K::Suffix> {
         Prefix::new(self.primary.namespace(), &p.prefix())
     }
 
-    pub fn sub_prefix_de(&self, p: K::SubPrefix) -> Prefix<K::SuperSuffix, T> {
+    pub fn sub_prefix(&self, p: K::SubPrefix) -> Prefix<K::SuperSuffix, T, K::SuperSuffix> {
         Prefix::new(self.primary.namespace(), &p.prefix())
     }
 
-    fn no_prefix_de(&self) -> Prefix<K, T> {
+    fn no_prefix(&self) -> Prefix<K, T, K> {
         Prefix::new(self.primary.namespace(), &[])
     }
 }
@@ -328,7 +338,7 @@ mod tests {
     const VALUES_START_5: &[(&str, Option<u64>)] =
         &[("A", Some(8)), ("B", None), ("C", Some(13)), ("D", None)];
 
-    // Same as `init_data`, but we have a composite key for testing range_de.
+    // Same as `init_data`, but we have a composite key for testing range.
     fn init_data_composite_key(map: &TestMapCompositeKey, storage: &mut dyn Storage) {
         map.save(storage, ("A", "B"), &5, 1).unwrap();
         map.save(storage, ("B", "A"), &7, 2).unwrap();
@@ -455,28 +465,80 @@ mod tests {
 
     #[test]
     #[cfg(feature = "iterator")]
-    fn range_de_simple_string_key() {
+    fn changelog_range_works() {
+        use cosmwasm_std::Order;
+
+        let mut store = MockStorage::new();
+
+        // simple data for testing
+        EVERY.save(&mut store, "A", &5, 1).unwrap();
+        EVERY.save(&mut store, "B", &7, 2).unwrap();
+        EVERY
+            .update(&mut store, "A", 3, |_| -> StdResult<u64> { Ok(8) })
+            .unwrap();
+        EVERY.remove(&mut store, "B", 4).unwrap();
+
+        // let's try to iterate over the changelog
+        let all: StdResult<Vec<_>> = EVERY
+            .changelog()
+            .range(&store, None, None, Order::Ascending)
+            .collect();
+        let all = all.unwrap();
+        assert_eq!(4, all.len());
+        assert_eq!(
+            all,
+            vec![
+                (("A".into(), 1), ChangeSet { old: None }),
+                (("A".into(), 3), ChangeSet { old: Some(5) }),
+                (("B".into(), 2), ChangeSet { old: None }),
+                (("B".into(), 4), ChangeSet { old: Some(7) })
+            ]
+        );
+
+        // let's try to iterate over a changelog key/prefix
+        let all: StdResult<Vec<_>> = EVERY
+            .changelog()
+            .prefix("B")
+            .range(&store, None, None, Order::Ascending)
+            .collect();
+        let all = all.unwrap();
+        assert_eq!(2, all.len());
+        assert_eq!(
+            all,
+            vec![
+                (2, ChangeSet { old: None }),
+                (4, ChangeSet { old: Some(7) })
+            ]
+        );
+
+        // let's try to iterate over a changelog prefixed range
+        let all: StdResult<Vec<_>> = EVERY
+            .changelog()
+            .prefix("A")
+            .range(&store, Some(Bound::inclusive(3u64)), None, Order::Ascending)
+            .collect();
+        let all = all.unwrap();
+        assert_eq!(1, all.len());
+        assert_eq!(all, vec![(3, ChangeSet { old: Some(5) }),]);
+    }
+
+    #[test]
+    #[cfg(feature = "iterator")]
+    fn range_simple_string_key() {
         use cosmwasm_std::Order;
 
         let mut store = MockStorage::new();
         init_data(&EVERY, &mut store);
 
         // let's try to iterate!
-        let all: StdResult<Vec<_>> = EVERY
-            .range_de(&store, None, None, Order::Ascending)
-            .collect();
+        let all: StdResult<Vec<_>> = EVERY.range(&store, None, None, Order::Ascending).collect();
         let all = all.unwrap();
         assert_eq!(2, all.len());
         assert_eq!(all, vec![("C".into(), 13), ("D".into(), 22)]);
 
         // let's try to iterate over a range
         let all: StdResult<Vec<_>> = EVERY
-            .range_de(
-                &store,
-                Some(Bound::Inclusive(b"C".to_vec())),
-                None,
-                Order::Ascending,
-            )
+            .range(&store, Some(Bound::inclusive("C")), None, Order::Ascending)
             .collect();
         let all = all.unwrap();
         assert_eq!(2, all.len());
@@ -484,12 +546,7 @@ mod tests {
 
         // let's try to iterate over a more restrictive range
         let all: StdResult<Vec<_>> = EVERY
-            .range_de(
-                &store,
-                Some(Bound::Inclusive(b"D".to_vec())),
-                None,
-                Order::Ascending,
-            )
+            .range(&store, Some(Bound::inclusive("D")), None, Order::Ascending)
             .collect();
         let all = all.unwrap();
         assert_eq!(1, all.len());
@@ -498,7 +555,7 @@ mod tests {
 
     #[test]
     #[cfg(feature = "iterator")]
-    fn range_de_composite_key() {
+    fn range_composite_key() {
         use cosmwasm_std::Order;
 
         let mut store = MockStorage::new();
@@ -506,7 +563,7 @@ mod tests {
 
         // let's try to iterate!
         let all: StdResult<Vec<_>> = EVERY_COMPOSITE_KEY
-            .range_de(&store, None, None, Order::Ascending)
+            .range(&store, None, None, Order::Ascending)
             .collect();
         let all = all.unwrap();
         assert_eq!(2, all.len());
@@ -521,7 +578,7 @@ mod tests {
 
     #[test]
     #[cfg(feature = "iterator")]
-    fn prefix_range_de_composite_key() {
+    fn prefix_range_composite_key() {
         use cosmwasm_std::Order;
 
         let mut store = MockStorage::new();
@@ -529,7 +586,7 @@ mod tests {
 
         // let's prefix-range and iterate
         let all: StdResult<Vec<_>> = EVERY_COMPOSITE_KEY
-            .prefix_range_de(
+            .prefix_range(
                 &store,
                 None,
                 Some(PrefixBound::exclusive("C")),
@@ -543,7 +600,7 @@ mod tests {
 
     #[test]
     #[cfg(feature = "iterator")]
-    fn prefix_de_composite_key() {
+    fn prefix_composite_key() {
         use cosmwasm_std::Order;
 
         let mut store = MockStorage::new();
@@ -551,8 +608,8 @@ mod tests {
 
         // let's prefix and iterate
         let all: StdResult<Vec<_>> = EVERY_COMPOSITE_KEY
-            .prefix_de("C")
-            .range_de(&store, None, None, Order::Ascending)
+            .prefix("C")
+            .range(&store, None, None, Order::Ascending)
             .collect();
         let all = all.unwrap();
         assert_eq!(1, all.len());
@@ -561,7 +618,7 @@ mod tests {
 
     #[test]
     #[cfg(feature = "iterator")]
-    fn sub_prefix_de_composite_key() {
+    fn sub_prefix_composite_key() {
         use cosmwasm_std::Order;
 
         let mut store = MockStorage::new();
@@ -569,10 +626,10 @@ mod tests {
 
         // Let's sub-prefix and iterate.
         // This is similar to calling range() directly, but added here for completeness /
-        // sub_prefix_de type checks
+        // sub_prefix type checks
         let all: StdResult<Vec<_>> = EVERY_COMPOSITE_KEY
-            .sub_prefix_de(())
-            .range_de(&store, None, None, Order::Ascending)
+            .sub_prefix(())
+            .range(&store, None, None, Order::Ascending)
             .collect();
         let all = all.unwrap();
         assert_eq!(2, all.len());

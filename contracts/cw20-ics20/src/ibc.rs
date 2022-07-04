@@ -2,15 +2,18 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use cosmwasm_std::{
-    attr, entry_point, from_binary, to_binary, BankMsg, Binary, ContractResult, DepsMut, Env,
+    attr, entry_point, from_binary, to_binary, BankMsg, Binary, CosmosMsg, Deps, DepsMut, Env,
     IbcBasicResponse, IbcChannel, IbcChannelCloseMsg, IbcChannelConnectMsg, IbcChannelOpenMsg,
     IbcEndpoint, IbcOrder, IbcPacket, IbcPacketAckMsg, IbcPacketReceiveMsg, IbcPacketTimeoutMsg,
-    IbcReceiveResponse, Reply, Response, StdResult, SubMsg, Uint128, WasmMsg,
+    IbcReceiveResponse, Reply, Response, SubMsg, SubMsgResult, Uint128, WasmMsg,
 };
 
 use crate::amount::Amount;
 use crate::error::{ContractError, Never};
-use crate::state::{ChannelInfo, CHANNEL_INFO, CHANNEL_STATE};
+use crate::state::{
+    reduce_channel_balance, undo_reduce_channel_balance, ChannelInfo, ReplyArgs, ALLOW_LIST,
+    CHANNEL_INFO, CONFIG, REPLY_ARGS,
+};
 use cw20::Cw20ExecuteMsg;
 
 pub const ICS20_VERSION: &str = "ics20-1";
@@ -72,21 +75,44 @@ fn ack_fail(err: String) -> Binary {
     to_binary(&res).unwrap()
 }
 
-const SEND_TOKEN_ID: u64 = 1337;
+const RECEIVE_ID: u64 = 1337;
+const ACK_FAILURE_ID: u64 = 0xfa17;
 
 #[cfg_attr(not(feature = "library"), entry_point)]
-pub fn reply(_deps: DepsMut, _env: Env, reply: Reply) -> Result<Response, ContractError> {
-    if reply.id != SEND_TOKEN_ID {
-        return Err(ContractError::UnknownReplyId { id: reply.id });
+pub fn reply(deps: DepsMut, _env: Env, reply: Reply) -> Result<Response, ContractError> {
+    match reply.id {
+        RECEIVE_ID => match reply.result {
+            SubMsgResult::Ok(_) => Ok(Response::new()),
+            SubMsgResult::Err(err) => {
+                // Important design note:  with ibcv2 and wasmd 0.22 we can implement this all much easier.
+                // No reply needed... the receive function and submessage should return error on failure and all
+                // state gets reverted with a proper app-level message auto-generated
+
+                // Since we need compatibility with Juno (Jan 2022), we need to ensure that optimisitic
+                // state updates in ibc_packet_receive get reverted in the (unlikely) chance of an
+                // error while sending the token
+
+                // However, this requires passing some state between the ibc_packet_receive function and
+                // the reply handler. We do this with a singleton, with is "okay" for IBC as there is no
+                // reentrancy on these functions (cannot be called by another contract). This pattern
+                // should not be used for ExecuteMsg handlers
+                let reply_args = REPLY_ARGS.load(deps.storage)?;
+                undo_reduce_channel_balance(
+                    deps.storage,
+                    &reply_args.channel,
+                    &reply_args.denom,
+                    reply_args.amount,
+                )?;
+
+                Ok(Response::new().set_data(ack_fail(err)))
+            }
+        },
+        ACK_FAILURE_ID => match reply.result {
+            SubMsgResult::Ok(_) => Ok(Response::new()),
+            SubMsgResult::Err(err) => Ok(Response::new().set_data(ack_fail(err))),
+        },
+        _ => Err(ContractError::UnknownReplyId { id: reply.id }),
     }
-    let res = match reply.result {
-        ContractResult::Ok(_) => Response::new(),
-        ContractResult::Err(err) => {
-            // encode an acknowledgement error
-            Response::new().set_data(ack_fail(err))
-        }
-    };
-    Ok(res)
 }
 
 #[cfg_attr(not(feature = "library"), entry_point)]
@@ -164,40 +190,15 @@ pub fn ibc_packet_receive(
 ) -> Result<IbcReceiveResponse, Never> {
     let packet = msg.packet;
 
-    let res = match do_ibc_packet_receive(deps, &packet) {
-        Ok(msg) => {
-            // build attributes first so we don't have to clone msg below
-            // similar event messages like ibctransfer module
-
-            // This cannot fail as we parse it in do_ibc_packet_receive. Best to pass the data somehow?
-            let denom = parse_voucher_denom(&msg.denom, &packet.src).unwrap();
-
-            let attributes = vec![
-                attr("action", "receive"),
-                attr("sender", &msg.sender),
-                attr("receiver", &msg.receiver),
-                attr("denom", denom),
-                attr("amount", msg.amount),
-                attr("success", "true"),
-            ];
-            let to_send = Amount::from_parts(denom.into(), msg.amount);
-            let msg = send_amount(to_send, msg.receiver);
-            IbcReceiveResponse::new()
-                .set_ack(ack_success())
-                .add_submessage(msg)
-                .add_attributes(attributes)
-        }
-        Err(err) => IbcReceiveResponse::new()
+    do_ibc_packet_receive(deps, &packet).or_else(|err| {
+        Ok(IbcReceiveResponse::new()
             .set_ack(ack_fail(err.to_string()))
             .add_attributes(vec![
                 attr("action", "receive"),
                 attr("success", "false"),
                 attr("error", err.to_string()),
-            ]),
-    };
-
-    // if we have funds, now send the tokens to the requested recipient
-    Ok(res)
+            ]))
+    })
 }
 
 // Returns local denom if the denom is an encoded voucher from the expected endpoint
@@ -226,7 +227,10 @@ fn parse_voucher_denom<'a>(
 }
 
 // this does the work of ibc_packet_receive, we wrap it to turn errors into acknowledgements
-fn do_ibc_packet_receive(deps: DepsMut, packet: &IbcPacket) -> Result<Ics20Packet, ContractError> {
+fn do_ibc_packet_receive(
+    deps: DepsMut,
+    packet: &IbcPacket,
+) -> Result<IbcReceiveResponse, ContractError> {
     let msg: Ics20Packet = from_binary(&packet.data)?;
     let channel = packet.dest.channel_id.clone();
 
@@ -234,21 +238,52 @@ fn do_ibc_packet_receive(deps: DepsMut, packet: &IbcPacket) -> Result<Ics20Packe
     // If it originated on our chain, it looks like "port/channel/ucosm".
     let denom = parse_voucher_denom(&msg.denom, &packet.src)?;
 
-    let amount = msg.amount;
-    CHANNEL_STATE.update(
-        deps.storage,
-        (&channel, denom),
-        |orig| -> Result<_, ContractError> {
-            // this will return error if we don't have the funds there to cover the request (or no denom registered)
-            let mut cur = orig.ok_or(ContractError::InsufficientFunds {})?;
-            cur.outstanding = cur
-                .outstanding
-                .checked_sub(amount)
-                .or(Err(ContractError::InsufficientFunds {}))?;
-            Ok(cur)
-        },
-    )?;
-    Ok(msg)
+    // make sure we have enough balance for this
+    reduce_channel_balance(deps.storage, &channel, denom, msg.amount)?;
+
+    // we need to save the data to update the balances in reply
+    let reply_args = ReplyArgs {
+        channel,
+        denom: denom.to_string(),
+        amount: msg.amount,
+    };
+    REPLY_ARGS.save(deps.storage, &reply_args)?;
+
+    let to_send = Amount::from_parts(denom.to_string(), msg.amount);
+    let gas_limit = check_gas_limit(deps.as_ref(), &to_send)?;
+    let send = send_amount(to_send, msg.receiver.clone());
+    let mut submsg = SubMsg::reply_on_error(send, RECEIVE_ID);
+    submsg.gas_limit = gas_limit;
+
+    let res = IbcReceiveResponse::new()
+        .set_ack(ack_success())
+        .add_submessage(submsg)
+        .add_attribute("action", "receive")
+        .add_attribute("sender", msg.sender)
+        .add_attribute("receiver", msg.receiver)
+        .add_attribute("denom", denom)
+        .add_attribute("amount", msg.amount)
+        .add_attribute("success", "true");
+
+    Ok(res)
+}
+
+fn check_gas_limit(deps: Deps, amount: &Amount) -> Result<Option<u64>, ContractError> {
+    match amount {
+        Amount::Cw20(coin) => {
+            // if cw20 token, use the registered gas limit, or error if not whitelisted
+            let addr = deps.api.addr_validate(&coin.address)?;
+            let allowed = ALLOW_LIST.may_load(deps.storage, &addr)?;
+            match allowed {
+                Some(allow) => Ok(allow.gas_limit),
+                None => match CONFIG.load(deps.storage)?.default_gas_limit {
+                    Some(base) => Ok(Some(base)),
+                    None => Err(ContractError::NotOnAllowList),
+                },
+            }
+        }
+        _ => Ok(None),
+    }
 }
 
 #[cfg_attr(not(feature = "library"), entry_point)]
@@ -258,7 +293,9 @@ pub fn ibc_packet_ack(
     _env: Env,
     msg: IbcPacketAckMsg,
 ) -> Result<IbcBasicResponse, ContractError> {
-    // TODO: trap error like in receive?
+    // Design decision: should we trap error like in receive?
+    // TODO: unsure... as it is now a failed ack handling would revert the tx and would be
+    // retried again and again. is that good?
     let ics20msg: Ics20Ack = from_binary(&msg.acknowledgement.data)?;
     match ics20msg {
         Ics20Ack::Result(_) => on_packet_success(deps, msg.original_packet),
@@ -273,14 +310,15 @@ pub fn ibc_packet_timeout(
     _env: Env,
     msg: IbcPacketTimeoutMsg,
 ) -> Result<IbcBasicResponse, ContractError> {
-    // TODO: trap error like in receive?
+    // TODO: trap error like in receive? (same question as ack above)
     let packet = msg.packet;
     on_packet_failure(deps, packet, "timeout".to_string())
 }
 
 // update the balance stored on this (channel, denom) index
-fn on_packet_success(deps: DepsMut, packet: IbcPacket) -> Result<IbcBasicResponse, ContractError> {
+fn on_packet_success(_deps: DepsMut, packet: IbcPacket) -> Result<IbcBasicResponse, ContractError> {
     let msg: Ics20Packet = from_binary(&packet.data)?;
+
     // similar event messages like ibctransfer module
     let attributes = vec![
         attr("action", "acknowledge"),
@@ -291,64 +329,58 @@ fn on_packet_success(deps: DepsMut, packet: IbcPacket) -> Result<IbcBasicRespons
         attr("success", "true"),
     ];
 
-    let channel = packet.src.channel_id;
-    let denom = msg.denom;
-    let amount = msg.amount;
-    CHANNEL_STATE.update(deps.storage, (&channel, &denom), |orig| -> StdResult<_> {
-        let mut state = orig.unwrap_or_default();
-        state.outstanding += amount;
-        state.total_sent += amount;
-        Ok(state)
-    })?;
-
     Ok(IbcBasicResponse::new().add_attributes(attributes))
 }
 
 // return the tokens to sender
 fn on_packet_failure(
-    _deps: DepsMut,
+    deps: DepsMut,
     packet: IbcPacket,
     err: String,
 ) -> Result<IbcBasicResponse, ContractError> {
     let msg: Ics20Packet = from_binary(&packet.data)?;
-    // similar event messages like ibctransfer module
-    let attributes = vec![
-        attr("action", "acknowledge"),
-        attr("sender", &msg.sender),
-        attr("receiver", &msg.receiver),
-        attr("denom", &msg.denom),
-        attr("amount", &msg.amount.to_string()),
-        attr("success", "false"),
-        attr("error", err),
-    ];
 
-    let amount = Amount::from_parts(msg.denom, msg.amount);
-    let msg = send_amount(amount, msg.sender);
-    Ok(IbcBasicResponse::new()
-        .add_attributes(attributes)
-        .add_submessage(msg))
+    // undo the balance update on failure (as we pre-emptively added it on send)
+    reduce_channel_balance(deps.storage, &packet.src.channel_id, &msg.denom, msg.amount)?;
+
+    let to_send = Amount::from_parts(msg.denom.clone(), msg.amount);
+    let gas_limit = check_gas_limit(deps.as_ref(), &to_send)?;
+    let send = send_amount(to_send, msg.sender.clone());
+    let mut submsg = SubMsg::reply_on_error(send, ACK_FAILURE_ID);
+    submsg.gas_limit = gas_limit;
+
+    // similar event messages like ibctransfer module
+    let res = IbcBasicResponse::new()
+        .add_submessage(submsg)
+        .add_attribute("action", "acknowledge")
+        .add_attribute("sender", msg.sender)
+        .add_attribute("receiver", msg.receiver)
+        .add_attribute("denom", msg.denom)
+        .add_attribute("amount", msg.amount.to_string())
+        .add_attribute("success", "false")
+        .add_attribute("error", err);
+
+    Ok(res)
 }
 
-fn send_amount(amount: Amount, recipient: String) -> SubMsg {
+fn send_amount(amount: Amount, recipient: String) -> CosmosMsg {
     match amount {
-        Amount::Native(coin) => SubMsg::reply_on_error(
-            BankMsg::Send {
-                to_address: recipient,
-                amount: vec![coin],
-            },
-            SEND_TOKEN_ID,
-        ),
+        Amount::Native(coin) => BankMsg::Send {
+            to_address: recipient,
+            amount: vec![coin],
+        }
+        .into(),
         Amount::Cw20(coin) => {
             let msg = Cw20ExecuteMsg::Transfer {
                 recipient,
                 amount: coin.amount,
             };
-            let exec = WasmMsg::Execute {
+            WasmMsg::Execute {
                 contract_addr: coin.address,
                 msg: to_binary(&msg).unwrap(),
                 funds: vec![],
-            };
-            SubMsg::reply_on_error(exec, SEND_TOKEN_ID)
+            }
+            .into()
         }
     }
 }
@@ -358,9 +390,11 @@ mod test {
     use super::*;
     use crate::test_helpers::*;
 
-    use crate::contract::query_channel;
-    use cosmwasm_std::testing::mock_env;
-    use cosmwasm_std::{coins, to_vec, IbcAcknowledgement, IbcEndpoint, IbcTimeout, Timestamp};
+    use crate::contract::{execute, migrate, query_channel};
+    use crate::msg::{ExecuteMsg, MigrateMsg, TransferMsg};
+    use cosmwasm_std::testing::{mock_env, mock_info};
+    use cosmwasm_std::{coins, to_vec, IbcEndpoint, IbcMsg, IbcTimeout, Timestamp};
+    use cw20::Cw20ReceiveMsg;
 
     #[test]
     fn check_ack_json() {
@@ -389,7 +423,12 @@ mod test {
         assert_eq!(expected, encdoded.as_str());
     }
 
-    fn cw20_payment(amount: u128, address: &str, recipient: &str) -> SubMsg {
+    fn cw20_payment(
+        amount: u128,
+        address: &str,
+        recipient: &str,
+        gas_limit: Option<u64>,
+    ) -> SubMsg {
         let msg = Cw20ExecuteMsg::Transfer {
             recipient: recipient.into(),
             amount: Uint128::new(amount),
@@ -399,7 +438,9 @@ mod test {
             msg: to_binary(&msg).unwrap(),
             funds: vec![],
         };
-        SubMsg::reply_on_error(exec, SEND_TOKEN_ID)
+        let mut msg = SubMsg::reply_on_error(exec, RECEIVE_ID);
+        msg.gas_limit = gas_limit;
+        msg
     }
 
     fn native_payment(amount: u128, denom: &str, recipient: &str) -> SubMsg {
@@ -408,31 +449,10 @@ mod test {
                 to_address: recipient.into(),
                 amount: coins(amount, denom),
             },
-            SEND_TOKEN_ID,
+            RECEIVE_ID,
         )
     }
 
-    fn mock_sent_packet(my_channel: &str, amount: u128, denom: &str, sender: &str) -> IbcPacket {
-        let data = Ics20Packet {
-            denom: denom.into(),
-            amount: amount.into(),
-            sender: sender.to_string(),
-            receiver: "remote-rcpt".to_string(),
-        };
-        IbcPacket::new(
-            to_binary(&data).unwrap(),
-            IbcEndpoint {
-                port_id: CONTRACT_PORT.to_string(),
-                channel_id: my_channel.to_string(),
-            },
-            IbcEndpoint {
-                port_id: REMOTE_PORT.to_string(),
-                channel_id: "channel-1234".to_string(),
-            },
-            2,
-            IbcTimeout::with_timestamp(Timestamp::from_seconds(1665321069)),
-        )
-    }
     fn mock_receive_packet(
         my_channel: &str,
         amount: u128,
@@ -465,29 +485,56 @@ mod test {
     #[test]
     fn send_receive_cw20() {
         let send_channel = "channel-9";
-        let mut deps = setup(&["channel-1", "channel-7", send_channel]);
-
         let cw20_addr = "token-addr";
         let cw20_denom = "cw20:token-addr";
+        let gas_limit = 1234567;
+        let mut deps = setup(
+            &["channel-1", "channel-7", send_channel],
+            &[(cw20_addr, gas_limit)],
+        );
 
         // prepare some mock packets
-        let sent_packet = mock_sent_packet(send_channel, 987654321, cw20_denom, "local-sender");
         let recv_packet = mock_receive_packet(send_channel, 876543210, cw20_denom, "local-rcpt");
         let recv_high_packet =
             mock_receive_packet(send_channel, 1876543210, cw20_denom, "local-rcpt");
 
-        let msg = IbcPacketReceiveMsg::new(recv_packet.clone());
         // cannot receive this denom yet
+        let msg = IbcPacketReceiveMsg::new(recv_packet.clone());
         let res = ibc_packet_receive(deps.as_mut(), mock_env(), msg).unwrap();
         assert!(res.messages.is_empty());
         let ack: Ics20Ack = from_binary(&res.acknowledgement).unwrap();
         let no_funds = Ics20Ack::Error(ContractError::InsufficientFunds {}.to_string());
         assert_eq!(ack, no_funds);
 
-        // we get a success cache (ack) for a send
-        let msg = IbcPacketAckMsg::new(IbcAcknowledgement::new(ack_success()), sent_packet);
-        let res = ibc_packet_ack(deps.as_mut(), mock_env(), msg).unwrap();
-        assert_eq!(0, res.messages.len());
+        // we send some cw20 tokens over
+        let transfer = TransferMsg {
+            channel: send_channel.to_string(),
+            remote_address: "remote-rcpt".to_string(),
+            timeout: None,
+        };
+        let msg = ExecuteMsg::Receive(Cw20ReceiveMsg {
+            sender: "local-sender".to_string(),
+            amount: Uint128::new(987654321),
+            msg: to_binary(&transfer).unwrap(),
+        });
+        let info = mock_info(cw20_addr, &[]);
+        let res = execute(deps.as_mut(), mock_env(), info, msg).unwrap();
+        assert_eq!(1, res.messages.len());
+        let expected = Ics20Packet {
+            denom: cw20_denom.into(),
+            amount: Uint128::new(987654321),
+            sender: "local-sender".to_string(),
+            receiver: "remote-rcpt".to_string(),
+        };
+        let timeout = mock_env().block.time.plus_seconds(DEFAULT_TIMEOUT);
+        assert_eq!(
+            &res.messages[0],
+            &SubMsg::new(IbcMsg::SendPacket {
+                channel_id: send_channel.to_string(),
+                data: to_binary(&expected).unwrap(),
+                timeout: IbcTimeout::with_timestamp(timeout),
+            })
+        );
 
         // query channel state|_|
         let state = query_channel(deps.as_ref(), send_channel.to_string()).unwrap();
@@ -506,11 +553,13 @@ mod test {
         let res = ibc_packet_receive(deps.as_mut(), mock_env(), msg).unwrap();
         assert_eq!(1, res.messages.len());
         assert_eq!(
-            cw20_payment(876543210, cw20_addr, "local-rcpt"),
+            cw20_payment(876543210, cw20_addr, "local-rcpt", Some(gas_limit)),
             res.messages[0]
         );
         let ack: Ics20Ack = from_binary(&res.acknowledgement).unwrap();
-        matches!(ack, Ics20Ack::Result(_));
+        assert!(matches!(ack, Ics20Ack::Result(_)));
+
+        // TODO: we need to call the reply block
 
         // query channel state
         let state = query_channel(deps.as_ref(), send_channel.to_string()).unwrap();
@@ -521,12 +570,11 @@ mod test {
     #[test]
     fn send_receive_native() {
         let send_channel = "channel-9";
-        let mut deps = setup(&["channel-1", "channel-7", send_channel]);
+        let mut deps = setup(&["channel-1", "channel-7", send_channel], &[]);
 
         let denom = "uatom";
 
         // prepare some mock packets
-        let sent_packet = mock_sent_packet(send_channel, 987654321, denom, "local-sender");
         let recv_packet = mock_receive_packet(send_channel, 876543210, denom, "local-rcpt");
         let recv_high_packet = mock_receive_packet(send_channel, 1876543210, denom, "local-rcpt");
 
@@ -538,10 +586,14 @@ mod test {
         let no_funds = Ics20Ack::Error(ContractError::InsufficientFunds {}.to_string());
         assert_eq!(ack, no_funds);
 
-        // we get a success cache (ack) for a send
-        let msg = IbcPacketAckMsg::new(IbcAcknowledgement::new(ack_success()), sent_packet);
-        let res = ibc_packet_ack(deps.as_mut(), mock_env(), msg).unwrap();
-        assert_eq!(0, res.messages.len());
+        // we transfer some tokens
+        let msg = ExecuteMsg::Transfer(TransferMsg {
+            channel: send_channel.to_string(),
+            remote_address: "my-remote-address".to_string(),
+            timeout: None,
+        });
+        let info = mock_info("local-sender", &coins(987654321, denom));
+        execute(deps.as_mut(), mock_env(), info, msg).unwrap();
 
         // query channel state|_|
         let state = query_channel(deps.as_ref(), send_channel.to_string()).unwrap();
@@ -564,11 +616,48 @@ mod test {
             res.messages[0]
         );
         let ack: Ics20Ack = from_binary(&res.acknowledgement).unwrap();
-        matches!(ack, Ics20Ack::Result(_));
+        assert!(matches!(ack, Ics20Ack::Result(_)));
+
+        // only need to call reply block on error case
 
         // query channel state
         let state = query_channel(deps.as_ref(), send_channel.to_string()).unwrap();
         assert_eq!(state.balances, vec![Amount::native(111111111, denom)]);
         assert_eq!(state.total_sent, vec![Amount::native(987654321, denom)]);
+    }
+
+    #[test]
+    fn check_gas_limit_handles_all_cases() {
+        let send_channel = "channel-9";
+        let allowed = "foobar";
+        let allowed_gas = 777666;
+        let mut deps = setup(&[send_channel], &[(allowed, allowed_gas)]);
+
+        // allow list will get proper gas
+        let limit = check_gas_limit(deps.as_ref(), &Amount::cw20(500, allowed)).unwrap();
+        assert_eq!(limit, Some(allowed_gas));
+
+        // non-allow list will error
+        let random = "tokenz";
+        check_gas_limit(deps.as_ref(), &Amount::cw20(500, random)).unwrap_err();
+
+        // add default_gas_limit
+        let def_limit = 54321;
+        migrate(
+            deps.as_mut(),
+            mock_env(),
+            MigrateMsg {
+                default_gas_limit: Some(def_limit),
+            },
+        )
+        .unwrap();
+
+        // allow list still gets proper gas
+        let limit = check_gas_limit(deps.as_ref(), &Amount::cw20(500, allowed)).unwrap();
+        assert_eq!(limit, Some(allowed_gas));
+
+        // non-allow list will now get default
+        let limit = check_gas_limit(deps.as_ref(), &Amount::cw20(500, random)).unwrap();
+        assert_eq!(limit, Some(def_limit));
     }
 }

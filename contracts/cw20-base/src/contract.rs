@@ -151,14 +151,32 @@ pub fn instantiate(
     Ok(Response::default())
 }
 
-pub fn create_accounts(deps: &mut DepsMut, accounts: &[Cw20Coin]) -> StdResult<Uint128> {
+pub fn create_accounts(
+    deps: &mut DepsMut,
+    accounts: &[Cw20Coin],
+) -> Result<Uint128, ContractError> {
+    validate_accounts(accounts)?;
+
     let mut total_supply = Uint128::zero();
     for row in accounts {
         let address = deps.api.addr_validate(&row.address)?;
         BALANCES.save(deps.storage, &address, &row.amount)?;
         total_supply += row.amount;
     }
+
     Ok(total_supply)
+}
+
+pub fn validate_accounts(accounts: &[Cw20Coin]) -> Result<(), ContractError> {
+    let mut addresses = accounts.iter().map(|c| &c.address).collect::<Vec<_>>();
+    addresses.sort();
+    addresses.dedup();
+
+    if addresses.len() != accounts.len() {
+        Err(ContractError::DuplicateInitialBalanceAddresses {})
+    } else {
+        Ok(())
+    }
 }
 
 #[cfg_attr(not(feature = "library"), entry_point)]
@@ -207,6 +225,9 @@ pub fn execute(
             marketing,
         } => execute_update_marketing(deps, env, info, project, description, marketing),
         ExecuteMsg::UploadLogo(logo) => execute_upload_logo(deps, env, info, logo),
+        ExecuteMsg::UpdateMinter { new_minter } => {
+            execute_update_minter(deps, env, info, new_minter)
+        }
     }
 }
 
@@ -286,8 +307,17 @@ pub fn execute_mint(
         return Err(ContractError::InvalidZeroAmount {});
     }
 
-    let mut config = TOKEN_INFO.load(deps.storage)?;
-    if config.mint.is_none() || config.mint.as_ref().unwrap().minter != info.sender {
+    let mut config = TOKEN_INFO
+        .may_load(deps.storage)?
+        .ok_or(ContractError::Unauthorized {})?;
+
+    if config
+        .mint
+        .as_ref()
+        .ok_or(ContractError::Unauthorized {})?
+        .minter
+        != info.sender
+    {
         return Err(ContractError::Unauthorized {});
     }
 
@@ -357,6 +387,35 @@ pub fn execute_send(
             .into_cosmos_msg(contract)?,
         );
     Ok(res)
+}
+
+pub fn execute_update_minter(
+    deps: DepsMut,
+    _env: Env,
+    info: MessageInfo,
+    new_minter: String,
+) -> Result<Response, ContractError> {
+    let mut config = TOKEN_INFO
+        .may_load(deps.storage)?
+        .ok_or(ContractError::Unauthorized {})?;
+
+    let mint = config.mint.as_ref().ok_or(ContractError::Unauthorized {})?;
+    if mint.minter != info.sender {
+        return Err(ContractError::Unauthorized {});
+    }
+
+    let minter = deps.api.addr_validate(&new_minter)?;
+    let minter_data = MinterData {
+        minter,
+        cap: mint.cap,
+    };
+    config.mint = Some(minter_data);
+
+    TOKEN_INFO.save(deps.storage, &config)?;
+
+    Ok(Response::default()
+        .add_attribute("action", "update_minter")
+        .add_attribute("new_minter", new_minter))
 }
 
 pub fn execute_update_marketing(
@@ -854,6 +913,59 @@ mod tests {
     }
 
     #[test]
+    fn minter_can_update_minter_but_not_cap() {
+        let mut deps = mock_dependencies();
+        let minter = String::from("minter");
+        let cap = Some(Uint128::from(3000000u128));
+        do_instantiate_with_minter(
+            deps.as_mut(),
+            &String::from("genesis"),
+            Uint128::new(1234),
+            &minter,
+            cap,
+        );
+
+        let new_minter = "new_minter";
+        let msg = ExecuteMsg::UpdateMinter {
+            new_minter: new_minter.to_string(),
+        };
+
+        let info = mock_info(&minter, &[]);
+        let env = mock_env();
+        let res = execute(deps.as_mut(), env.clone(), info, msg);
+        assert!(res.is_ok());
+        let query_minter_msg = QueryMsg::Minter {};
+        let res = query(deps.as_ref(), env, query_minter_msg);
+        let mint: MinterResponse = from_binary(&res.unwrap()).unwrap();
+
+        // Minter cannot update cap.
+        assert!(mint.cap == cap);
+        assert!(mint.minter == new_minter)
+    }
+
+    #[test]
+    fn others_cannot_update_minter() {
+        let mut deps = mock_dependencies();
+        let minter = String::from("minter");
+        do_instantiate_with_minter(
+            deps.as_mut(),
+            &String::from("genesis"),
+            Uint128::new(1234),
+            &minter,
+            None,
+        );
+
+        let msg = ExecuteMsg::UpdateMinter {
+            new_minter: String::from("new_minter"),
+        };
+
+        let info = mock_info("not the minter", &[]);
+        let env = mock_env();
+        let err = execute(deps.as_mut(), env, info, msg).unwrap_err();
+        assert_eq!(err, ContractError::Unauthorized {});
+    }
+
+    #[test]
     fn no_one_mints_if_minter_unset() {
         let mut deps = mock_dependencies();
         do_instantiate(deps.as_mut(), &String::from("genesis"), Uint128::new(1234));
@@ -875,6 +987,32 @@ mod tests {
         let addr1 = String::from("addr0001");
         let amount2 = Uint128::from(7890987u128);
         let addr2 = String::from("addr0002");
+        let info = mock_info("creator", &[]);
+        let env = mock_env();
+
+        // Fails with duplicate addresses
+        let instantiate_msg = InstantiateMsg {
+            name: "Bash Shell".to_string(),
+            symbol: "BASH".to_string(),
+            decimals: 6,
+            initial_balances: vec![
+                Cw20Coin {
+                    address: addr1.clone(),
+                    amount: amount1,
+                },
+                Cw20Coin {
+                    address: addr1.clone(),
+                    amount: amount2,
+                },
+            ],
+            mint: None,
+            marketing: None,
+        };
+        let err =
+            instantiate(deps.as_mut(), env.clone(), info.clone(), instantiate_msg).unwrap_err();
+        assert_eq!(err, ContractError::DuplicateInitialBalanceAddresses {});
+
+        // Works with unique addresses
         let instantiate_msg = InstantiateMsg {
             name: "Bash Shell".to_string(),
             symbol: "BASH".to_string(),
@@ -892,11 +1030,8 @@ mod tests {
             mint: None,
             marketing: None,
         };
-        let info = mock_info("creator", &[]);
-        let env = mock_env();
         let res = instantiate(deps.as_mut(), env, info, instantiate_msg).unwrap();
         assert_eq!(0, res.messages.len());
-
         assert_eq!(
             query_token_info(deps.as_ref()).unwrap(),
             TokenInfoResponse {

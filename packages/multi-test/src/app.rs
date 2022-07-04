@@ -1,11 +1,13 @@
 use std::fmt::{self, Debug};
 use std::marker::PhantomData;
 
+use anyhow::bail;
 use anyhow::Result as AnyResult;
 use cosmwasm_std::testing::{mock_env, MockApi, MockStorage};
 use cosmwasm_std::{
-    from_slice, to_binary, Addr, Api, Binary, BlockInfo, ContractResult, CustomQuery, Empty,
-    Querier, QuerierResult, QuerierWrapper, QueryRequest, Storage, SystemError, SystemResult,
+    from_slice, to_binary, Addr, Api, Binary, BlockInfo, ContractResult, CosmosMsg, CustomQuery,
+    Empty, Querier, QuerierResult, QuerierWrapper, QueryRequest, Record, Storage, SystemError,
+    SystemResult,
 };
 use schemars::JsonSchema;
 use serde::de::DeserializeOwned;
@@ -17,7 +19,6 @@ use crate::executor::{AppResponse, Executor};
 use crate::module::{FailingModule, Module};
 use crate::staking::{Distribution, FailingDistribution, FailingStaking, Staking, StakingSudo};
 use crate::transactions::transactional;
-use crate::untyped_msg::CosmosMsg;
 use crate::wasm::{ContractData, Wasm, WasmKeeper, WasmSudo};
 
 pub fn next_block(block: &mut BlockInfo) {
@@ -557,13 +558,18 @@ where
 {
     /// This registers contract code (like uploading wasm bytecode on a chain),
     /// so it can later be used to instantiate a contract.
-    pub fn store_code(&mut self, code: Box<dyn Contract<CustomT::ExecT>>) -> u64 {
+    pub fn store_code(&mut self, code: Box<dyn Contract<CustomT::ExecT, CustomT::QueryT>>) -> u64 {
         self.init_modules(|router, _, _| router.wasm.store_code(code) as u64)
     }
 
     /// This allows to get `ContractData` for specific contract
     pub fn contract_data(&self, address: &Addr) -> AnyResult<ContractData> {
         self.read_module(|router, _, storage| router.wasm.load_contract(storage, address))
+    }
+
+    /// This gets a raw state dump of all key-values held by a given contract
+    pub fn dump_wasm_raw(&self, address: &Addr) -> Vec<Record> {
+        self.read_module(|router, _, storage| router.wasm.dump_wasm_raw(storage, address))
     }
 }
 
@@ -621,7 +627,7 @@ where
 
         transactional(&mut *storage, |write_cache, _| {
             msgs.into_iter()
-                .map(|msg| router.execute(&*api, write_cache, block, sender.clone(), msg.into()))
+                .map(|msg| router.execute(&*api, write_cache, block, sender.clone(), msg))
                 .collect()
         })
     }
@@ -793,6 +799,7 @@ where
             CosmosMsg::Distribution(msg) => self
                 .distribution
                 .execute(api, storage, self, block, sender, msg),
+            _ => bail!("Cannot execute {:?}", msg),
         }
     }
 
@@ -924,7 +931,7 @@ where
             Ok(v) => v,
             Err(e) => {
                 return SystemResult::Err(SystemError::InvalidRequest {
-                    error: format!("Parsing query request: {}", e.to_string()),
+                    error: format!("Parsing query request: {}", e),
                     request: bin_request.into(),
                 })
             }
@@ -947,7 +954,7 @@ mod test {
     };
 
     use crate::error::Error;
-    use crate::test_helpers::contracts::{echo, hackatom, payout, reflect};
+    use crate::test_helpers::contracts::{caller, echo, error, hackatom, payout, reflect};
     use crate::test_helpers::{CustomMsg, EmptyMsg};
     use crate::transactions::StorageTransaction;
 
@@ -1492,7 +1499,7 @@ mod test {
                 lucky_winner: winner.clone(),
                 runner_up: second.clone(),
             });
-            app.execute(Addr::unchecked("anyone"), msg.into()).unwrap();
+            app.execute(Addr::unchecked("anyone"), msg).unwrap();
 
             // see if coins were properly added
             let big_win = app.wrap().query_balance(&winner, denom).unwrap();
@@ -2441,7 +2448,7 @@ mod test {
     mod protobuf_wrapped_data {
         use super::*;
         use crate::test_helpers::contracts::echo::EXECUTE_REPLY_BASE_ID;
-        use utils::parse_instantiate_response_data;
+        use cw_utils::parse_instantiate_response_data;
 
         #[test]
         fn instantiate_wrapped_properly() {
@@ -2578,6 +2585,156 @@ mod test {
             // execute_contract now decodes a protobuf wrapper, so we get the top-level response
             let exec_res = app.execute_contract(owner, echo_addr, &msg, &[]).unwrap();
             assert_eq!(exec_res.data, Some(Binary::from(b"hello")));
+        }
+    }
+
+    mod errors {
+        use super::*;
+
+        #[test]
+        fn simple_instantiation() {
+            let owner = Addr::unchecked("owner");
+            let mut app = App::default();
+
+            // set up contract
+            let code_id = app.store_code(error::contract(false));
+            let msg = EmptyMsg {};
+            let err = app
+                .instantiate_contract(code_id, owner, &msg, &[], "error", None)
+                .unwrap_err();
+
+            // we should be able to retrieve the original error by downcasting
+            let source: &StdError = err.downcast_ref().unwrap();
+            if let StdError::GenericErr { msg } = source {
+                assert_eq!(msg, "Init failed");
+            } else {
+                panic!("wrong StdError variant");
+            }
+
+            // We're expecting exactly 2 nested error types
+            // (the original error, WasmMsg context)
+            assert_eq!(err.chain().count(), 2);
+        }
+
+        #[test]
+        fn simple_call() {
+            let owner = Addr::unchecked("owner");
+            let mut app = App::default();
+
+            // set up contract
+            let code_id = app.store_code(error::contract(true));
+            let msg = EmptyMsg {};
+            let contract_addr = app
+                .instantiate_contract(code_id, owner, &msg, &[], "error", None)
+                .unwrap();
+
+            // execute should error
+            let err = app
+                .execute_contract(Addr::unchecked("random"), contract_addr, &msg, &[])
+                .unwrap_err();
+
+            // we should be able to retrieve the original error by downcasting
+            let source: &StdError = err.downcast_ref().unwrap();
+            if let StdError::GenericErr { msg } = source {
+                assert_eq!(msg, "Handle failed");
+            } else {
+                panic!("wrong StdError variant");
+            }
+
+            // We're expecting exactly 2 nested error types
+            // (the original error, WasmMsg context)
+            assert_eq!(err.chain().count(), 2);
+        }
+
+        #[test]
+        fn nested_call() {
+            let owner = Addr::unchecked("owner");
+            let mut app = App::default();
+
+            let error_code_id = app.store_code(error::contract(true));
+            let caller_code_id = app.store_code(caller::contract());
+
+            // set up contracts
+            let msg = EmptyMsg {};
+            let caller_addr = app
+                .instantiate_contract(caller_code_id, owner.clone(), &msg, &[], "caller", None)
+                .unwrap();
+            let error_addr = app
+                .instantiate_contract(error_code_id, owner, &msg, &[], "error", None)
+                .unwrap();
+
+            // execute should error
+            let msg = WasmMsg::Execute {
+                contract_addr: error_addr.into(),
+                msg: to_binary(&EmptyMsg {}).unwrap(),
+                funds: vec![],
+            };
+            let err = app
+                .execute_contract(Addr::unchecked("random"), caller_addr, &msg, &[])
+                .unwrap_err();
+
+            // we can downcast to get the original error
+            let source: &StdError = err.downcast_ref().unwrap();
+            if let StdError::GenericErr { msg } = source {
+                assert_eq!(msg, "Handle failed");
+            } else {
+                panic!("wrong StdError variant");
+            }
+
+            // We're expecting exactly 3 nested error types
+            // (the original error, 2 WasmMsg contexts)
+            assert_eq!(err.chain().count(), 3);
+        }
+
+        #[test]
+        fn double_nested_call() {
+            let owner = Addr::unchecked("owner");
+            let mut app = App::default();
+
+            let error_code_id = app.store_code(error::contract(true));
+            let caller_code_id = app.store_code(caller::contract());
+
+            // set up contracts
+            let msg = EmptyMsg {};
+            let caller_addr1 = app
+                .instantiate_contract(caller_code_id, owner.clone(), &msg, &[], "caller", None)
+                .unwrap();
+            let caller_addr2 = app
+                .instantiate_contract(caller_code_id, owner.clone(), &msg, &[], "caller", None)
+                .unwrap();
+            let error_addr = app
+                .instantiate_contract(error_code_id, owner, &msg, &[], "error", None)
+                .unwrap();
+
+            // caller1 calls caller2, caller2 calls error
+            let msg = WasmMsg::Execute {
+                contract_addr: caller_addr2.into(),
+                msg: to_binary(&WasmMsg::Execute {
+                    contract_addr: error_addr.into(),
+                    msg: to_binary(&EmptyMsg {}).unwrap(),
+                    funds: vec![],
+                })
+                .unwrap(),
+                funds: vec![],
+            };
+            let err = app
+                .execute_contract(Addr::unchecked("random"), caller_addr1, &msg, &[])
+                .unwrap_err();
+
+            // uncomment to have the test fail and see how the error stringifies
+            // panic!("{:?}", err);
+
+            // we can downcast to get the original error
+            let source: &StdError = err.downcast_ref().unwrap();
+            if let StdError::GenericErr { msg } = source {
+                assert_eq!(msg, "Handle failed");
+            } else {
+                panic!("wrong StdError variant");
+            }
+
+            // We're expecting exactly 4 nested error types
+            // (the original error, 3 WasmMsg contexts)
+            assert_eq!(err.chain().count(), 4);
         }
     }
 }

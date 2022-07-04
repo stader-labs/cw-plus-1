@@ -3,7 +3,8 @@ use std::string::FromUtf8Error;
 use thiserror::Error;
 
 use cosmwasm_std::StdError;
-use utils::PaymentError;
+use cw_controllers::AdminError;
+use cw_utils::PaymentError;
 
 /// Never is a placeholder to ensure we don't return any errors
 #[derive(Error, Debug)]
@@ -16,6 +17,9 @@ pub enum ContractError {
 
     #[error("{0}")]
     Payment(#[from] PaymentError),
+
+    #[error("{0}")]
+    Admin(#[from] AdminError),
 
     #[error("Channel doesn't exist: {id}")]
     NoSuchChannel { id: String },
@@ -47,8 +51,20 @@ pub enum ContractError {
     #[error("Cannot migrate from different contract type: {previous_contract}")]
     CannotMigrate { previous_contract: String },
 
+    #[error("Cannot migrate from unsupported version: {previous_version}")]
+    CannotMigrateVersion { previous_version: String },
+
     #[error("Got a submessage reply with unknown id: {id}")]
     UnknownReplyId { id: u64 },
+
+    #[error("You cannot lower the gas limit for a contract on the allow list")]
+    CannotLowerGas,
+
+    #[error("Only the governance contract can do this")]
+    Unauthorized,
+
+    #[error("You can only send cw20 tokens that have been explicitly allowed by governance")]
+    NotOnAllowList,
 }
 
 impl From<FromUtf8Error> for ContractError {

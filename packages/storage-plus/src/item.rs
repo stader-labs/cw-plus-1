@@ -2,13 +2,15 @@ use serde::de::DeserializeOwned;
 use serde::Serialize;
 use std::marker::PhantomData;
 
-use cosmwasm_std::{to_vec, Addr, QuerierWrapper, StdError, StdResult, Storage, WasmQuery};
+use cosmwasm_std::{
+    to_vec, Addr, CustomQuery, QuerierWrapper, StdError, StdResult, Storage, WasmQuery,
+};
 
 use crate::helpers::{may_deserialize, must_deserialize};
 
 /// Item stores one typed item at the given key.
 /// This is an analog of Singleton.
-/// It functions just as Path but doesn't ue a Vec and thus has a const fn constructor.
+/// It functions the same way as Path does but doesn't use a Vec and thus has a const fn constructor.
 pub struct Item<'a, T> {
     // this is full key - no need to length-prefix it, we only store one item
     storage_key: &'a [u8],
@@ -77,7 +79,11 @@ where
     /// from a remote contract in a type-safe way using WasmQuery::RawQuery.
     ///
     /// Note that we expect an Item to be set, and error if there is no data there
-    pub fn query(&self, querier: &QuerierWrapper, remote_contract: Addr) -> StdResult<T> {
+    pub fn query<Q: CustomQuery>(
+        &self,
+        querier: &QuerierWrapper<Q>,
+        remote_contract: Addr,
+    ) -> StdResult<T> {
         let request = WasmQuery::Raw {
             contract_addr: remote_contract.into(),
             key: self.storage_key.into(),
