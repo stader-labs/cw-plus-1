@@ -1,8 +1,7 @@
-use schemars::JsonSchema;
-use serde::{Deserialize, Serialize};
-
+use cosmwasm_schema::cw_serde;
 use cosmwasm_std::{
-    to_binary, Addr, CosmosMsg, Empty, QuerierWrapper, QueryRequest, StdResult, WasmMsg, WasmQuery,
+    to_json_binary, Addr, CosmosMsg, CustomQuery, QuerierWrapper, QueryRequest, StdResult, WasmMsg,
+    WasmQuery,
 };
 
 use crate::msg::Cw4ExecuteMsg;
@@ -16,7 +15,7 @@ use cw_storage_plus::{Item, Map};
 /// for working with cw4 contracts
 ///
 /// If you wish to persist this, convert to Cw4CanonicalContract via .canonical()
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, JsonSchema)]
+#[cw_serde]
 pub struct Cw4Contract(pub Addr);
 
 impl Cw4Contract {
@@ -31,7 +30,7 @@ impl Cw4Contract {
     fn encode_msg(&self, msg: Cw4ExecuteMsg) -> StdResult<CosmosMsg> {
         Ok(WasmMsg::Execute {
             contract_addr: self.addr().into(),
-            msg: to_binary(&msg)?,
+            msg: to_json_binary(&msg)?,
             funds: vec![],
         }
         .into())
@@ -43,7 +42,7 @@ impl Cw4Contract {
     }
 
     pub fn remove_hook<T: Into<String>>(&self, addr: T) -> StdResult<CosmosMsg> {
-        let msg = Cw4ExecuteMsg::AddHook { addr: addr.into() };
+        let msg = Cw4ExecuteMsg::RemoveHook { addr: addr.into() };
         self.encode_msg(msg)
     }
 
@@ -54,16 +53,16 @@ impl Cw4Contract {
         self.encode_msg(msg)
     }
 
-    fn encode_smart_query(&self, msg: Cw4QueryMsg) -> StdResult<QueryRequest<Empty>> {
+    fn encode_smart_query<Q: CustomQuery>(&self, msg: Cw4QueryMsg) -> StdResult<QueryRequest<Q>> {
         Ok(WasmQuery::Smart {
             contract_addr: self.addr().into(),
-            msg: to_binary(&msg)?,
+            msg: to_json_binary(&msg)?,
         }
         .into())
     }
 
     /// Show the hooks
-    pub fn hooks(&self, querier: &QuerierWrapper) -> StdResult<Vec<String>> {
+    pub fn hooks<Q: CustomQuery>(&self, querier: &QuerierWrapper<Q>) -> StdResult<Vec<String>> {
         let query = self.encode_smart_query(Cw4QueryMsg::Hooks {})?;
         let res: HooksResponse = querier.query(&query)?;
         Ok(res.hooks)

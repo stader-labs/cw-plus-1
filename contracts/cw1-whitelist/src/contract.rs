@@ -4,7 +4,7 @@ use std::fmt;
 #[cfg(not(feature = "library"))]
 use cosmwasm_std::entry_point;
 use cosmwasm_std::{
-    to_binary, Addr, Api, Binary, CosmosMsg, Deps, DepsMut, Empty, Env, MessageInfo, Response,
+    to_json_binary, Addr, Api, Binary, CosmosMsg, Deps, DepsMut, Empty, Env, MessageInfo, Response,
     StdResult,
 };
 
@@ -36,7 +36,7 @@ pub fn instantiate(
 }
 
 pub fn map_validate(api: &dyn Api, admins: &[String]) -> StdResult<Vec<Addr>> {
-    admins.iter().map(|addr| api.addr_validate(&addr)).collect()
+    admins.iter().map(|addr| api.addr_validate(addr)).collect()
 }
 
 #[cfg_attr(not(feature = "library"), entry_point)]
@@ -111,15 +111,17 @@ pub fn execute_update_admins(
 
 fn can_execute(deps: Deps, sender: &str) -> StdResult<bool> {
     let cfg = ADMIN_LIST.load(deps.storage)?;
-    let can = cfg.is_admin(&sender);
+    let can = cfg.is_admin(sender);
     Ok(can)
 }
 
 #[cfg_attr(not(feature = "library"), entry_point)]
 pub fn query(deps: Deps, _env: Env, msg: QueryMsg) -> StdResult<Binary> {
     match msg {
-        QueryMsg::AdminList {} => to_binary(&query_admin_list(deps)?),
-        QueryMsg::CanExecute { sender, msg } => to_binary(&query_can_execute(deps, sender, msg)?),
+        QueryMsg::AdminList {} => to_json_binary(&query_admin_list(deps)?),
+        QueryMsg::CanExecute { sender, msg } => {
+            to_json_binary(&query_can_execute(deps, sender, msg)?)
+        }
     }
 }
 
@@ -151,9 +153,9 @@ mod tests {
     fn instantiate_and_modify_config() {
         let mut deps = mock_dependencies();
 
-        let alice = "alice";
-        let bob = "bob";
-        let carl = "carl";
+        let alice = deps.api.addr_make("alice").to_string();
+        let bob = deps.api.addr_make("bob").to_string();
+        let carl = deps.api.addr_make("carl").to_string();
 
         let anyone = "anyone";
 
@@ -162,7 +164,7 @@ mod tests {
             admins: vec![alice.to_string(), bob.to_string(), carl.to_string()],
             mutable: true,
         };
-        let info = mock_info(&anyone, &[]);
+        let info = mock_info(anyone, &[]);
         instantiate(deps.as_mut(), mock_env(), info, instantiate_msg).unwrap();
 
         // ensure expected config
@@ -176,7 +178,7 @@ mod tests {
         let msg = ExecuteMsg::UpdateAdmins {
             admins: vec![anyone.to_string()],
         };
-        let info = mock_info(&anyone, &[]);
+        let info = mock_info(anyone, &[]);
         let err = execute(deps.as_mut(), mock_env(), info, msg).unwrap_err();
         assert_eq!(err, ContractError::Unauthorized {});
 
@@ -203,7 +205,7 @@ mod tests {
         let info = mock_info(&bob, &[]);
         execute(deps.as_mut(), mock_env(), info, ExecuteMsg::Freeze {}).unwrap();
         let expected = AdminListResponse {
-            admins: vec![alice.to_string(), bob.to_string()],
+            admins: vec![alice.to_string(), bob],
             mutable: false,
         };
         assert_eq!(query_admin_list(deps.as_ref()).unwrap(), expected);
@@ -221,13 +223,13 @@ mod tests {
     fn execute_messages_has_proper_permissions() {
         let mut deps = mock_dependencies();
 
-        let alice = "alice";
-        let bob = "bob";
-        let carl = "carl";
+        let alice = deps.api.addr_make("alice").to_string();
+        let bob = deps.api.addr_make("bob").to_string();
+        let carl = deps.api.addr_make("carl").to_string();
 
         // instantiate the contract
         let instantiate_msg = InstantiateMsg {
-            admins: vec![alice.to_string(), carl.to_string()],
+            admins: vec![alice, carl.to_string()],
             mutable: false,
         };
         let info = mock_info(&bob, &[]);
@@ -242,7 +244,7 @@ mod tests {
             .into(),
             WasmMsg::Execute {
                 contract_addr: "some contract".into(),
-                msg: to_binary(&freeze).unwrap(),
+                msg: to_json_binary(&freeze).unwrap(),
                 funds: vec![],
             }
             .into(),
@@ -270,8 +272,8 @@ mod tests {
     fn can_execute_query_works() {
         let mut deps = mock_dependencies();
 
-        let alice = "alice";
-        let bob = "bob";
+        let alice = deps.api.addr_make("alice").to_string();
+        let bob = deps.api.addr_make("bob").to_string();
 
         let anyone = "anyone";
 
@@ -280,7 +282,7 @@ mod tests {
             admins: vec![alice.to_string(), bob.to_string()],
             mutable: false,
         };
-        let info = mock_info(&anyone, &[]);
+        let info = mock_info(anyone, &[]);
         instantiate(deps.as_mut(), mock_env(), info, instantiate_msg).unwrap();
 
         // let us make some queries... different msg types by owner and by other
@@ -294,11 +296,11 @@ mod tests {
         });
 
         // owner can send
-        let res = query_can_execute(deps.as_ref(), alice.to_string(), send_msg.clone()).unwrap();
+        let res = query_can_execute(deps.as_ref(), alice, send_msg.clone()).unwrap();
         assert!(res.can_execute);
 
         // owner can stake
-        let res = query_can_execute(deps.as_ref(), bob.to_string(), staking_msg.clone()).unwrap();
+        let res = query_can_execute(deps.as_ref(), bob, staking_msg.clone()).unwrap();
         assert!(res.can_execute);
 
         // anyone cannot send

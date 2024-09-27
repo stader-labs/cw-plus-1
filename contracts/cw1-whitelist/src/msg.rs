@@ -1,17 +1,17 @@
 use schemars::JsonSchema;
-use serde::{Deserialize, Serialize};
+
 use std::fmt;
 
+use cosmwasm_schema::{cw_serde, QueryResponses};
 use cosmwasm_std::{CosmosMsg, Empty};
 
-#[derive(Serialize, Deserialize, JsonSchema)]
+#[cw_serde]
 pub struct InstantiateMsg {
     pub admins: Vec<String>,
     pub mutable: bool,
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, JsonSchema)]
-#[serde(rename_all = "snake_case")]
+#[cw_serde]
 pub enum ExecuteMsg<T = Empty>
 where
     T: Clone + fmt::Debug + PartialEq + JsonSchema,
@@ -27,21 +27,23 @@ where
     UpdateAdmins { admins: Vec<String> },
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, JsonSchema)]
-#[serde(rename_all = "snake_case")]
+#[cw_serde]
+#[derive(QueryResponses)]
 pub enum QueryMsg<T = Empty>
 where
     T: Clone + fmt::Debug + PartialEq + JsonSchema,
 {
     /// Shows all admins and whether or not it is mutable
+    #[returns(AdminListResponse)]
     AdminList {},
     /// Checks permissions of the caller on this proxy.
     /// If CanExecute returns true then a call to `Execute` with the same message,
     /// before any further state changes, should also succeed.
+    #[returns(cw1::CanExecuteResponse)]
     CanExecute { sender: String, msg: CosmosMsg<T> },
 }
 
-#[derive(Serialize, Deserialize, Clone, PartialEq, JsonSchema, Debug)]
+#[cw_serde]
 pub struct AdminListResponse {
     pub admins: Vec<String>,
     pub mutable: bool,
@@ -49,8 +51,8 @@ pub struct AdminListResponse {
 
 #[cfg(any(test, feature = "test-utils"))]
 impl AdminListResponse {
-    /// Utility function forconverting message to its canonical form, so two messages with
-    /// different representation but same semantical meaning can be easly compared.
+    /// Utility function for converting message to its canonical form, so two messages with
+    /// different representation but same semantic meaning can be easily compared.
     ///
     /// It could be encapsulated in custom `PartialEq` implementation, but `PartialEq` is expected
     /// to be quickly, so it seems to be reasonable to keep it as representation-equality, and

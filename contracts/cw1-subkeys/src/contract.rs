@@ -5,8 +5,8 @@ use std::ops::{AddAssign, Sub};
 #[cfg(not(feature = "library"))]
 use cosmwasm_std::entry_point;
 use cosmwasm_std::{
-    ensure, ensure_ne, to_binary, BankMsg, Binary, Coin, CosmosMsg, Deps, DepsMut, DistributionMsg,
-    Empty, Env, MessageInfo, Order, Response, StakingMsg, StdResult,
+    ensure, ensure_ne, to_json_binary, BankMsg, Binary, Coin, CosmosMsg, Deps, DepsMut,
+    DistributionMsg, Empty, Env, MessageInfo, Order, Response, StakingMsg, StdResult,
 };
 use cw1::CanExecuteResponse;
 use cw1_whitelist::{
@@ -19,8 +19,8 @@ use cw1_whitelist::{
 };
 use cw2::{get_contract_version, set_contract_version};
 use cw_storage_plus::Bound;
+use cw_utils::Expiration;
 use semver::Version;
-use utils::Expiration;
 
 use crate::error::ContractError;
 use crate::msg::{
@@ -304,17 +304,17 @@ where
 #[cfg_attr(not(feature = "library"), entry_point)]
 pub fn query(deps: Deps, env: Env, msg: QueryMsg) -> StdResult<Binary> {
     match msg {
-        QueryMsg::AdminList {} => to_binary(&query_admin_list(deps)?),
-        QueryMsg::Allowance { spender } => to_binary(&query_allowance(deps, env, spender)?),
-        QueryMsg::Permissions { spender } => to_binary(&query_permissions(deps, spender)?),
+        QueryMsg::AdminList {} => to_json_binary(&query_admin_list(deps)?),
+        QueryMsg::Allowance { spender } => to_json_binary(&query_allowance(deps, env, spender)?),
+        QueryMsg::Permissions { spender } => to_json_binary(&query_permissions(deps, spender)?),
         QueryMsg::CanExecute { sender, msg } => {
-            to_binary(&query_can_execute(deps, env, sender, msg)?)
+            to_json_binary(&query_can_execute(deps, env, sender, msg)?)
         }
         QueryMsg::AllAllowances { start_after, limit } => {
-            to_binary(&query_all_allowances(deps, env, start_after, limit)?)
+            to_json_binary(&query_all_allowances(deps, env, start_after, limit)?)
         }
         QueryMsg::AllPermissions { start_after, limit } => {
-            to_binary(&query_all_permissions(deps, start_after, limit)?)
+            to_json_binary(&query_all_permissions(deps, start_after, limit)?)
         }
     }
 }
@@ -407,9 +407,9 @@ pub fn query_all_allowances(
 ) -> StdResult<AllAllowancesResponse> {
     let limit = calc_limit(limit);
     // we use raw addresses here....
-    let start = start_after.map(Bound::exclusive);
+    let start = start_after.map(|s| Bound::ExclusiveRaw(s.into()));
 
-    let res: StdResult<Vec<AllowanceInfo>> = ALLOWANCES
+    let allowances = ALLOWANCES
         .range(deps.storage, start, None, Order::Ascending)
         .filter(|item| {
             if let Ok((_, allow)) = item {
@@ -420,16 +420,14 @@ pub fn query_all_allowances(
         })
         .take(limit)
         .map(|item| {
-            item.and_then(|(k, allow)| {
-                Ok(AllowanceInfo {
-                    spender: String::from_utf8(k)?,
-                    balance: allow.balance,
-                    expires: allow.expires,
-                })
+            item.map(|(addr, allow)| AllowanceInfo {
+                spender: addr.into(),
+                balance: allow.balance,
+                expires: allow.expires,
             })
         })
-        .collect();
-    Ok(AllAllowancesResponse { allowances: res? })
+        .collect::<StdResult<Vec<_>>>()?;
+    Ok(AllAllowancesResponse { allowances })
 }
 
 // return a list of all permissions here
@@ -439,25 +437,23 @@ pub fn query_all_permissions(
     limit: Option<u32>,
 ) -> StdResult<AllPermissionsResponse> {
     let limit = calc_limit(limit);
-    let start = start_after.map(Bound::exclusive);
+    let start = start_after.map(|s| Bound::ExclusiveRaw(s.into()));
 
-    let res: StdResult<Vec<PermissionsInfo>> = PERMISSIONS
+    let permissions = PERMISSIONS
         .range(deps.storage, start, None, Order::Ascending)
         .take(limit)
         .map(|item| {
-            item.and_then(|(k, perm)| {
-                Ok(PermissionsInfo {
-                    spender: String::from_utf8(k)?,
-                    permissions: perm,
-                })
+            item.map(|(addr, perm)| PermissionsInfo {
+                spender: addr.into(),
+                permissions: perm,
             })
         })
-        .collect();
-    Ok(AllPermissionsResponse { permissions: res? })
+        .collect::<StdResult<Vec<_>>>()?;
+    Ok(AllPermissionsResponse { permissions })
 }
 
 // Migrate contract if version is lower than current version
-#[entry_point]
+#[cfg_attr(not(feature = "library"), entry_point)]
 pub fn migrate(deps: DepsMut, _env: Env, _msg: Empty) -> Result<Response, ContractError> {
     let version: Version = CONTRACT_VERSION.parse()?;
     let storage_version: Version = get_contract_version(deps.storage)?.version.parse()?;
@@ -481,7 +477,9 @@ mod tests {
 
     use cw1_whitelist::msg::AdminListResponse;
     use cw2::{get_contract_version, ContractVersion};
-    use utils::NativeBalance;
+    use cw_utils::NativeBalance;
+
+    use easy_addr::addr;
 
     use crate::state::Permissions;
 
@@ -489,15 +487,15 @@ mod tests {
 
     use super::*;
 
-    const OWNER: &str = "owner";
+    const OWNER: &str = addr!("owner");
 
-    const ADMIN1: &str = "admin1";
-    const ADMIN2: &str = "admin2";
+    const ADMIN1: &str = addr!("admin1");
+    const ADMIN2: &str = addr!("admin2");
 
-    const SPENDER1: &str = "spender1";
-    const SPENDER2: &str = "spender2";
-    const SPENDER3: &str = "spender3";
-    const SPENDER4: &str = "spender4";
+    const SPENDER1: &str = addr!("spender1");
+    const SPENDER2: &str = addr!("spender2");
+    const SPENDER3: &str = addr!("spender3");
+    const SPENDER4: &str = addr!("spender4");
 
     const TOKEN: &str = "token";
     const TOKEN1: &str = "token1";
@@ -553,8 +551,7 @@ mod tests {
             let item = self.spenders.entry(spender).or_default();
             assert!(
                 item.allowances_expire.is_none(),
-                "Allowances expiration for spender {} already configured",
-                spender
+                "Allowances expiration for spender {spender} already configured",
             );
             item.allowances_expire = Some(expires);
             self
@@ -564,8 +561,7 @@ mod tests {
             let item = self.spenders.entry(spender).or_default();
             assert!(
                 item.permissions.is_none(),
-                "Permissions for spender {} already configured",
-                spender
+                "Permissions for spender {spender} already configured",
             );
             item.permissions = Some(permissions);
             self
@@ -908,7 +904,7 @@ mod tests {
             .unwrap();
 
             assert_eq!(rsp.messages, vec![]);
-            assert_eq!(rsp.events, vec![]);
+            assert!(rsp.events.is_empty());
             assert_eq!(rsp.data, None);
 
             assert_eq!(
@@ -937,7 +933,7 @@ mod tests {
             .unwrap();
 
             assert_eq!(rsp.messages, vec![]);
-            assert_eq!(rsp.events, vec![]);
+            assert!(rsp.events.is_empty());
             assert_eq!(rsp.data, None);
 
             assert_eq!(
@@ -1040,7 +1036,7 @@ mod tests {
             .unwrap();
 
             assert_eq!(rsp.messages, vec![]);
-            assert_eq!(rsp.events, vec![]);
+            assert!(rsp.events.is_empty());
             assert_eq!(rsp.data, None);
 
             assert_eq!(
@@ -1082,7 +1078,7 @@ mod tests {
             .unwrap();
 
             assert_eq!(rsp.messages, vec![]);
-            assert_eq!(rsp.events, vec![]);
+            assert!(rsp.events.is_empty());
             assert_eq!(rsp.data, None);
 
             assert_eq!(
@@ -1121,7 +1117,7 @@ mod tests {
             .unwrap();
 
             assert_eq!(rsp.messages, vec![]);
-            assert_eq!(rsp.events, vec![]);
+            assert!(rsp.events.is_empty());
             assert_eq!(rsp.data, None);
 
             assert_eq!(
@@ -1160,7 +1156,7 @@ mod tests {
             .unwrap();
 
             assert_eq!(rsp.messages, vec![]);
-            assert_eq!(rsp.events, vec![]);
+            assert!(rsp.events.is_empty());
             assert_eq!(rsp.data, None);
 
             assert_eq!(
@@ -1206,7 +1202,7 @@ mod tests {
             .unwrap();
 
             assert_eq!(rsp.messages, vec![]);
-            assert_eq!(rsp.events, vec![]);
+            assert!(rsp.events.is_empty());
             assert_eq!(rsp.data, None);
 
             assert_eq!(
@@ -1253,7 +1249,7 @@ mod tests {
             .unwrap();
 
             assert_eq!(rsp.messages, vec![]);
-            assert_eq!(rsp.events, vec![]);
+            assert!(rsp.events.is_empty());
             assert_eq!(rsp.data, None);
 
             assert_eq!(
@@ -1368,7 +1364,7 @@ mod tests {
             .unwrap();
 
             assert_eq!(rsp.messages, vec![]);
-            assert_eq!(rsp.events, vec![]);
+            assert!(rsp.events.is_empty());
             assert_eq!(rsp.data, None);
 
             assert_eq!(
@@ -1409,7 +1405,7 @@ mod tests {
             .unwrap();
 
             assert_eq!(rsp.messages, vec![]);
-            assert_eq!(rsp.events, vec![]);
+            assert!(rsp.events.is_empty());
             assert_eq!(rsp.data, None);
 
             assert_eq!(
@@ -1450,7 +1446,7 @@ mod tests {
             .unwrap();
 
             assert_eq!(rsp.messages, vec![]);
-            assert_eq!(rsp.events, vec![]);
+            assert!(rsp.events.is_empty());
             assert_eq!(rsp.data, None);
 
             assert_eq!(
@@ -1490,7 +1486,7 @@ mod tests {
             .unwrap();
 
             assert_eq!(rsp.messages, vec![]);
-            assert_eq!(rsp.events, vec![]);
+            assert!(rsp.events.is_empty());
             assert_eq!(rsp.data, None);
 
             assert_eq!(
@@ -1523,7 +1519,7 @@ mod tests {
             .unwrap();
 
             assert_eq!(rsp.messages, vec![]);
-            assert_eq!(rsp.events, vec![]);
+            assert!(rsp.events.is_empty());
             assert_eq!(rsp.data, None);
 
             assert_eq!(
@@ -1707,7 +1703,7 @@ mod tests {
                 rsp.messages,
                 msgs.into_iter().map(SubMsg::new).collect::<Vec<_>>()
             );
-            assert_eq!(rsp.events, vec![]);
+            assert!(rsp.events.is_empty());
             assert_eq!(rsp.data, None);
 
             assert_eq!(
@@ -1874,7 +1870,7 @@ mod tests {
                 rsp.messages,
                 msgs.into_iter().map(SubMsg::new).collect::<Vec<_>>()
             );
-            assert_eq!(rsp.events, vec![]);
+            assert!(rsp.events.is_empty());
             assert_eq!(rsp.data, None);
 
             assert_eq!(
@@ -1909,7 +1905,7 @@ mod tests {
                 rsp.messages,
                 msgs.into_iter().map(SubMsg::new).collect::<Vec<_>>()
             );
-            assert_eq!(rsp.events, vec![]);
+            assert!(rsp.events.is_empty());
             assert_eq!(rsp.data, None);
         }
 
@@ -1977,7 +1973,7 @@ mod tests {
                     rsp.messages,
                     msgs.into_iter().map(SubMsg::new).collect::<Vec<_>>()
                 );
-                assert_eq!(rsp.events, vec![]);
+                assert!(rsp.events.is_empty());
                 assert_eq!(rsp.data, None);
             }
         }
@@ -2023,7 +2019,7 @@ mod tests {
                     rsp.messages,
                     msgs.into_iter().map(SubMsg::new).collect::<Vec<_>>()
                 );
-                assert_eq!(rsp.events, vec![]);
+                assert!(rsp.events.is_empty());
                 assert_eq!(rsp.data, None);
             }
         }
@@ -2103,8 +2099,7 @@ mod tests {
                 assert_eq!(
                     resp,
                     CanExecuteResponse { can_execute: true },
-                    "Original message: {:#?}",
-                    msg
+                    "Original message: {msg:#?}",
                 );
             }
         }
@@ -2172,8 +2167,7 @@ mod tests {
                 assert_eq!(
                     resp,
                     CanExecuteResponse { can_execute: false },
-                    "Original message: {:#?}",
-                    msg
+                    "Original message: {msg:#?}",
                 );
             }
         }
@@ -2222,8 +2216,7 @@ mod tests {
                 assert_eq!(
                     resp,
                     CanExecuteResponse { can_execute: true },
-                    "Original message: {:#?}",
-                    msg
+                    "Original message: {msg:#?}",
                 );
             }
         }
@@ -2234,12 +2227,12 @@ mod tests {
     fn permissions_allowances_independent() {
         let mut deps = mock_dependencies();
 
-        let owner = "admin0001";
+        let owner = addr!("admin0001");
         let admins = vec![owner.to_string()];
 
         // spender1 has every permission to stake
-        let spender1 = "spender0001";
-        let spender2 = "spender0002";
+        let spender1 = addr!("spender0001");
+        let spender2 = addr!("spender0002");
         let denom = "token1";
         let amount = 10000;
         let coin = coin(amount, denom);

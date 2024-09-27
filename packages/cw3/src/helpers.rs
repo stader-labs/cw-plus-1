@@ -1,10 +1,8 @@
-use schemars::JsonSchema;
-use serde::{Deserialize, Serialize};
-
-use cosmwasm_std::{to_binary, Addr, CosmosMsg, StdResult, WasmMsg};
+use cosmwasm_schema::cw_serde;
+use cosmwasm_std::{to_json_binary, Addr, CosmosMsg, StdResult, WasmMsg};
 
 use crate::msg::{Cw3ExecuteMsg, Vote};
-use utils::Expiration;
+use cw_utils::Expiration;
 
 /// Cw3Contract is a wrapper around Addr that provides a lot of helpers
 /// for working with this.
@@ -13,7 +11,7 @@ use utils::Expiration;
 ///
 /// FIXME: Cw3Contract currently only supports CosmosMsg<Empty>. When we actually
 /// use this in some consuming code, we should make it generic over CosmosMsg<T>.
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, JsonSchema)]
+#[cw_serde]
 pub struct Cw3Contract(pub Addr);
 
 impl Cw3Contract {
@@ -24,7 +22,7 @@ impl Cw3Contract {
     pub fn encode_msg(&self, msg: Cw3ExecuteMsg) -> StdResult<CosmosMsg> {
         Ok(WasmMsg::Execute {
             contract_addr: self.addr().into(),
-            msg: to_binary(&msg)?,
+            msg: to_json_binary(&msg)?,
             funds: vec![],
         }
         .into())

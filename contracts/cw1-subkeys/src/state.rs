@@ -4,13 +4,13 @@ use std::fmt;
 
 use cosmwasm_std::Addr;
 use cw_storage_plus::Map;
-use utils::{Expiration, NativeBalance};
+use cw_utils::{Expiration, NativeBalance};
 
 // Permissions struct defines users message execution permissions.
 // Could have implemented permissions for each cosmos module(StakingPermissions, GovPermissions etc...)
 // But that meant a lot of code for each module. Keeping the permissions inside one struct is more
 // optimal. Define other modules permissions here.
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, JsonSchema, Default, Copy)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema, Default, Copy)]
 pub struct Permissions {
     pub delegate: bool,
     pub redelegate: bool,
@@ -46,7 +46,7 @@ impl Allowance {
     /// Example:
     ///
     /// ```
-    /// # use utils::{Expiration, NativeBalance};
+    /// # use cw_utils::{Expiration, NativeBalance};
     /// # use cw1_subkeys::state::Allowance;
     /// # use cosmwasm_std::coin;
     ///
